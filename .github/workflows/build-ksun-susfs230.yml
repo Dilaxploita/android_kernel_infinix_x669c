@@ -62,6 +62,28 @@ jobs:
 
           grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
 
+          # Perbaiki deklarasi yang hilang di fs/open.c jika patch SUSFS/KSU masuk sebagian
+          python3 - << 'PYEOF'
+          with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
+              content = f.read()
+
+          if "ksu_su_compat_enabled" in content:
+              header_fix = """
+          #include <linux/jump_label.h>
+          #ifndef KSU_OPEN_FIX
+          #define KSU_OPEN_FIX
+          extern struct static_key_false ksu_su_compat_enabled;
+          extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
+          #endif
+          """
+              content = content.replace("#include <linux/fs.h>", "#include <linux/fs.h>\n" + header_fix, 1)
+              content = content.replace("fname = getname_flags(filename, lookup_flags, NULL);",
+                                        "struct filename *fname = getname_flags(filename, lookup_flags, NULL);")
+              with open("fs/open.c", "w", encoding="utf-8") as f:
+                  f.write(content)
+          PYEOF
+
           ./scripts/config --file arch/arm64/configs/x669c_defconfig \
             -e CONFIG_KSU_SUSFS \
             -e CONFIG_KSU_SUSFS_SUS_PATH \
@@ -95,8 +117,8 @@ jobs:
           grep -q "STRUCT_ALIGN();" include/asm-generic/vmlinux.lds.h || \
           sed -i 's/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) {/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) { STRUCT_ALIGN();/g' include/asm-generic/vmlinux.lds.h
 
-          # Hilangkan -Werror pada sub-Makefile kernel 4.19 agar peringatan Clang baru tidak menghentikan build
-          find . -name "Makefile" -exec sed -i 's/-Werror//g' {} +
+          # Hapus semua flag -Werror di Makefile & Kbuild agar Clang 19 tidak menghentikan build pada warning
+          find . -type f \( -name "Makefile*" -o -name "Kbuild*" \) -exec sed -i 's/-Werror//g' {} +
 
       - name: Build Kernel Image.gz
         run: |
