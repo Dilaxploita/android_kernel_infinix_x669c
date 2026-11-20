@@ -62,46 +62,43 @@ jobs:
 
           grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
 
-          # Perbaiki fs/open.c: tambahkan internal.h, deklarasi fname, dan hook KSU yang bersih
+          # Perbaiki fs/open.c jika patch SUSFS menyisipkan blok fname / ksu_su_compat_enabled
           python3 - << 'PYEOF'
           with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
-              content = f.read()
+              lines = f.readlines()
 
-          # Pastikan internal.h ter-include untuk getname_flags & filename_lookup
-          if '#include "internal.h"' not in content:
-              content = content.replace('#include <linux/fs.h>', '#include <linux/fs.h>\n#include "internal.h"', 1)
+          new_lines = []
+          skip = False
+          injected_header = False
 
-          # Jika patch SUSFS menyisipkan blok getname_flags / ksu_su_compat_enabled di do_faccessat
-          if "fname = getname_flags(filename, lookup_flags, NULL);" in content:
-              header_fix = """
-          #ifdef CONFIG_KSU
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
-          #endif
-          """
-              content = content.replace('#include "internal.h"', '#include "internal.h"\n' + header_fix, 1)
+          for line in lines:
+              if not injected_header and line.startswith("#include <linux/fs.h>"):
+                  new_lines.append(line)
+                  new_lines.append('#include "internal.h"\n')
+                  new_lines.append('#ifdef CONFIG_KSU\n')
+                  new_lines.append('extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n')
+                  new_lines.append('#endif\n')
+                  injected_header = True
+                  continue
 
-              # Ganti blok getname_flags + ksu_su_compat_enabled yang gagal kompilasi dengan hook standar 4.19
-              import re
-              bad_block = re.compile(
-                  r'fname = getname_flags\(filename, lookup_flags, NULL\);.*?res = filename_lookup\(dfd, fname, lookup_flags, &path, NULL\);',
-                  re.DOTALL
-              )
-              clean_replacement = """#ifdef CONFIG_KSU
-          \tksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif
-          \t{
-          \t\tstruct filename *fname = getname_flags(filename, lookup_flags, NULL);
-          \t\tif (IS_ERR(fname)) {
-          \t\t\tres = PTR_ERR(fname);
-          \t\t\tgoto out;
-          \t\t}
-          \t\tres = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
-          \t\tputname(fname);
-          \t}"""
-              content = bad_block.sub(clean_replacement, content)
+              if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
+                  skip = True
+                  new_lines.append("#ifdef CONFIG_KSU\n")
+                  new_lines.append("\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n")
+                  new_lines.append("#endif\n")
+                  new_lines.append("\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
+                  continue
+
+              if skip:
+                  if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
+                      skip = False
+                  continue
+
+              new_lines.append(line)
 
           with open("fs/open.c", "w", encoding="utf-8") as f:
-              f.write(content)
+              f.writelines(new_lines)
+          print("fs/open.c patched cleanly for X669C 4.19.")
           PYEOF
 
           ./scripts/config --file arch/arm64/configs/x669c_defconfig \
@@ -137,8 +134,7 @@ jobs:
           grep -q "STRUCT_ALIGN();" include/asm-generic/vmlinux.lds.h || \
           sed -i 's/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) {/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) { STRUCT_ALIGN();/g' include/asm-generic/vmlinux.lds.h
 
-          # Hapus -Werror dari seluruh Makefile (termasuk mm/Makefile)
-          find . -type f \( -name "Makefile*" -o -name "Kbuild*" \) -exec sed -i 's/-Werror//g' {} +
+          sed -i 's/-Werror//g' mm/Makefile
 
       - name: Build Kernel Image.gz
         run: |
