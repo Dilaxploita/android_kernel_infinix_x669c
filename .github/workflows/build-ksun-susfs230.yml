@@ -92,7 +92,7 @@ jobs:
           for line in lines:
               if not injected and line.startswith("#include <linux/fs.h>"):
                   new_lines.append(line)
-                  new_lines.append("#include \"internal.h\"\n#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n")
+                  new_lines.append("#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n")
                   injected = True
                   continue
               if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
