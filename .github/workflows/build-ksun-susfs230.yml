@@ -1,124 +1,144 @@
-name: Build Rootzone Kernel (KSUN + SUSFS) - X669C
+name: Build Kernel X669C
 
 on:
   workflow_dispatch:
     inputs:
-      include_dtb:
-        description: 'Sertakan mtk.dtb ke dalam ZIP AnyKernel3'
+      ksu:
+        description: 'Enable KernelSU Next (KSUN)'
         required: true
-        default: false
         type: boolean
+        default: true
+      susfs:
+        description: 'Enable SUSFS (Kernel 4.19)'
+        required: true
+        type: boolean
+        default: true
+      include_dtb:
+        description: 'Include mtk.dtb in AnyKernel3 ZIP'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   build-kernel:
-    name: Compile X669C (4.19 + KSUN + SUSFS)
+    name: Build X669C | KSUN:${{ github.event.inputs.ksu }} | SUSFS:${{ github.event.inputs.susfs }}
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout Kernel Source
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Install Build Dependencies
+      - name: Set up Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex git \
-            libncurses5-dev libssl-dev libxml2 lzop python3 unzip zip \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi wget
+          sudo apt-get install -y bc bison build-essential ccache curl flex gawk \
+            git gnupg gperf libncurses-dev libssl-dev libxml2 libxml2-utils \
+            lzop rsync schedtool zip zlib1g-dev python3 wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Download AOSP Clang Toolchain
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-x669c-ccache-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-x669c-ccache-
+
+      - name: Setup ZyC-Clang 16 Toolchain
         run: |
-          mkdir -p $HOME/clang
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r530567.tar.gz -O clang.tar.gz
-          tar -xzf clang.tar.gz -C $HOME/clang
-          rm -f clang.tar.gz
+          mkdir -p $HOME/zyc-clang
+          cd $HOME/zyc-clang
+          wget -q https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260807-release/Clang-16.0.6-20260807.tar.gz || \
+          wget -q https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20240504-release/Clang-16.0.6-20240504.tar.gz
+          tar -zxf Clang-*.tar.gz
+          rm -f Clang-*.tar.gz
 
-      - name: Setup KernelSU Next (KSUN)
+      - name: Setup KernelSU Next & SUSFS
         run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
-
-          ./scripts/config --file arch/arm64/configs/x669c_defconfig \
-            -e CONFIG_KSU \
-            -d CONFIG_KPROBES \
-            -d CONFIG_HAVE_KPROBES \
-            -d CONFIG_KRETPROBES
-
-      - name: Setup SUSFS (Kernel 4.19 Compatible)
-        run: |
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu || \
-          git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu
-
-          cp -r ../susfs4ksu/kernel_patches/fs/* fs/
-          cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
-
-          patch -p1 --fuzz=3 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
-
-          if [ -d "KernelSU-Next" ] && [ -f "../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
-            cd KernelSU-Next
-            patch -p1 --fuzz=3 --forward < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-            cd ..
+          if [ "${{ github.event.inputs.ksu }}" == "true" ]; then
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+            ./scripts/config --file arch/arm64/configs/x669c_defconfig \
+              -e CONFIG_KSU \
+              -d CONFIG_KPROBES \
+              -d CONFIG_HAVE_KPROBES \
+              -d CONFIG_KRETPROBES
           fi
 
-          grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
+          if [ "${{ github.event.inputs.susfs }}" == "true" ]; then
+            git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu || \
+            git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu
 
-          # Perbaiki fs/open.c jika patch SUSFS menyisipkan blok fname / ksu_su_compat_enabled
-          python3 - << 'PYEOF'
-          with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
-              lines = f.readlines()
+            cp -r ../susfs4ksu/kernel_patches/fs/* fs/
+            cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
 
-          new_lines = []
-          skip = False
-          injected_header = False
+            patch -p1 --fuzz=3 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
 
-          for line in lines:
-              if not injected_header and line.startswith("#include <linux/fs.h>"):
-                  new_lines.append(line)
-                  new_lines.append('#include "internal.h"\n')
-                  new_lines.append('#ifdef CONFIG_KSU\n')
-                  new_lines.append('extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n')
-                  new_lines.append('#endif\n')
-                  injected_header = True
-                  continue
+            if [ -d "KernelSU-Next" ] && [ -f "../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+              cd KernelSU-Next
+              patch -p1 --fuzz=3 --forward < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
+              cd ..
+            fi
 
-              if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
-                  skip = True
-                  new_lines.append("#ifdef CONFIG_KSU\n")
-                  new_lines.append("\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n")
-                  new_lines.append("#endif\n")
-                  new_lines.append("\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
-                  continue
+            grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
 
-              if skip:
-                  if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
-                      skip = False
-                  continue
+            python3 - << 'PYEOF'
+            with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
 
-              new_lines.append(line)
+            new_lines = []
+            skip = False
+            injected_header = False
 
-          with open("fs/open.c", "w", encoding="utf-8") as f:
-              f.writelines(new_lines)
-          print("fs/open.c patched cleanly for X669C 4.19.")
-          PYEOF
+            for line in lines:
+                if not injected_header and line.startswith("#include <linux/fs.h>"):
+                    new_lines.append(line)
+                    new_lines.append('#include "internal.h"\n')
+                    new_lines.append('#ifdef CONFIG_KSU\n')
+                    new_lines.append('extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n')
+                    new_lines.append('#endif\n')
+                    injected_header = True
+                    continue
 
-          ./scripts/config --file arch/arm64/configs/x669c_defconfig \
-            -e CONFIG_KSU_SUSFS \
-            -e CONFIG_KSU_SUSFS_SUS_PATH \
-            -e CONFIG_KSU_SUSFS_SUS_MOUNT \
-            -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
-            -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-            -e CONFIG_KSU_SUSFS_SUS_KSTAT \
-            -e CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
-            -e CONFIG_KSU_SUSFS_TRY_UMOUNT \
-            -e CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
-            -e CONFIG_KSU_SUSFS_SPOOF_UNAME \
-            -e CONFIG_KSU_SUSFS_ENABLE_LOG \
-            -e CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-            -e CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-            -e CONFIG_KSU_SUSFS_OPEN_REDIRECT \
-            -e CONFIG_KSU_SUSFS_SUS_SU
+                if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
+                    skip = True
+                    new_lines.append("#ifdef CONFIG_KSU\n")
+                    new_lines.append("\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n")
+                    new_lines.append("#endif\n")
+                    new_lines.append("\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
+                    continue
 
-      - name: Apply MT6765 & Clang Compatibility Fixes
+                if skip:
+                    if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
+                        skip = False
+                    continue
+
+                new_lines.append(line)
+
+            with open("fs/open.c", "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+            PYEOF
+
+            ./scripts/config --file arch/arm64/configs/x669c_defconfig \
+              -e CONFIG_KSU_SUSFS \
+              -e CONFIG_KSU_SUSFS_SUS_PATH \
+              -e CONFIG_KSU_SUSFS_SUS_MOUNT \
+              -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+              -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+              -e CONFIG_KSU_SUSFS_SUS_KSTAT \
+              -e CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
+              -e CONFIG_KSU_SUSFS_TRY_UMOUNT \
+              -e CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+              -e CONFIG_KSU_SUSFS_SPOOF_UNAME \
+              -e CONFIG_KSU_SUSFS_ENABLE_LOG \
+              -e CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              -e CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              -e CONFIG_KSU_SUSFS_OPEN_REDIRECT \
+              -e CONFIG_KSU_SUSFS_SUS_SU
+          fi
+
+      - name: Compatibility Fixes & Compile Kernel
         run: |
           grep -q "stpcpy" lib/string.c || cat << 'STPEOF' >> lib/string.c
 
@@ -136,9 +156,7 @@ jobs:
 
           sed -i 's/-Werror//g' mm/Makefile
 
-      - name: Build Kernel Image.gz
-        run: |
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="$HOME/zyc-clang/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
           export KBUILD_BUILD_USER="Rootzone"
@@ -147,7 +165,7 @@ jobs:
           make O=out ARCH=arm64 x669c_defconfig
 
           make -j$(nproc --all) O=out ARCH=arm64 \
-               CC="clang --target=aarch64-linux-gnu -fno-integrated-as -Wno-error -Wno-unused-but-set-variable --prefix=/usr/bin/aarch64-linux-gnu-" \
+               CC="ccache clang --target=aarch64-linux-gnu -fno-integrated-as -Wno-error --prefix=/usr/bin/aarch64-linux-gnu-" \
                LD=aarch64-linux-gnu-ld \
                AR=llvm-ar \
                NM=llvm-nm \
@@ -156,10 +174,9 @@ jobs:
                STRIP=llvm-strip \
                CROSS_COMPILE=aarch64-linux-gnu- \
                CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-               KCFLAGS="-Wno-error -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-unused-variable -Wno-sometimes-uninitialized -Wno-fortify-source" \
                Image.gz
 
-      - name: Package AnyKernel3 Flashable ZIP
+      - name: Package & Upload Flashable ZIP
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cp out/arch/arm64/boot/Image.gz AnyKernel3/
@@ -169,9 +186,8 @@ jobs:
           fi
 
           cat << 'AKEOF' > AnyKernel3/anykernel.sh
-          # AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=Rootzone Kernel KSUN + SUSFS - Infinix Hot 30i (X669C)
+          kernel.string=Rootzone Kernel KSUN+SUSFS - Infinix Hot 30i (X669C)
           do.devicecheck=0
           do.modules=0
           do.systemless=1
@@ -200,11 +216,11 @@ jobs:
 
           cd AnyKernel3
           DATE=$(date +"%Y%m%d-%H%M")
-          zip -r9 ../Kernel-X669C-KSUN-SUSFS-${DATE}.zip * -x .git README.md *placeholder
+          zip -r9 ../RootzoneKernel-X669C-${DATE}.zip * -x .git README.md *placeholder
 
-      - name: Upload Flashable ZIP Artifact
+      - name: Upload Flashable ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-X669C-KSUN-SUSFS
-          path: Kernel-X669C-KSUN-SUSFS-*.zip
-          retention-days: 14
+          name: RootzoneKernel-X669C-${{ github.run_id }}
+          path: RootzoneKernel-X669C-*.zip
+          compression-level: 0
