@@ -62,26 +62,46 @@ jobs:
 
           grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
 
-          # Perbaiki deklarasi yang hilang di fs/open.c jika patch SUSFS/KSU masuk sebagian
+          # Perbaiki fs/open.c: tambahkan internal.h, deklarasi fname, dan hook KSU yang bersih
           python3 - << 'PYEOF'
           with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
               content = f.read()
 
-          if "ksu_su_compat_enabled" in content:
+          # Pastikan internal.h ter-include untuk getname_flags & filename_lookup
+          if '#include "internal.h"' not in content:
+              content = content.replace('#include <linux/fs.h>', '#include <linux/fs.h>\n#include "internal.h"', 1)
+
+          # Jika patch SUSFS menyisipkan blok getname_flags / ksu_su_compat_enabled di do_faccessat
+          if "fname = getname_flags(filename, lookup_flags, NULL);" in content:
               header_fix = """
-          #include <linux/jump_label.h>
-          #ifndef KSU_OPEN_FIX
-          #define KSU_OPEN_FIX
-          extern struct static_key_false ksu_su_compat_enabled;
-          extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+          #ifdef CONFIG_KSU
           extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
           #endif
           """
-              content = content.replace("#include <linux/fs.h>", "#include <linux/fs.h>\n" + header_fix, 1)
-              content = content.replace("fname = getname_flags(filename, lookup_flags, NULL);",
-                                        "struct filename *fname = getname_flags(filename, lookup_flags, NULL);")
-              with open("fs/open.c", "w", encoding="utf-8") as f:
-                  f.write(content)
+              content = content.replace('#include "internal.h"', '#include "internal.h"\n' + header_fix, 1)
+
+              # Ganti blok getname_flags + ksu_su_compat_enabled yang gagal kompilasi dengan hook standar 4.19
+              import re
+              bad_block = re.compile(
+                  r'fname = getname_flags\(filename, lookup_flags, NULL\);.*?res = filename_lookup\(dfd, fname, lookup_flags, &path, NULL\);',
+                  re.DOTALL
+              )
+              clean_replacement = """#ifdef CONFIG_KSU
+          \tksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+          \t{
+          \t\tstruct filename *fname = getname_flags(filename, lookup_flags, NULL);
+          \t\tif (IS_ERR(fname)) {
+          \t\t\tres = PTR_ERR(fname);
+          \t\t\tgoto out;
+          \t\t}
+          \t\tres = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
+          \t\tputname(fname);
+          \t}"""
+              content = bad_block.sub(clean_replacement, content)
+
+          with open("fs/open.c", "w", encoding="utf-8") as f:
+              f.write(content)
           PYEOF
 
           ./scripts/config --file arch/arm64/configs/x669c_defconfig \
@@ -117,7 +137,7 @@ jobs:
           grep -q "STRUCT_ALIGN();" include/asm-generic/vmlinux.lds.h || \
           sed -i 's/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) {/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) { STRUCT_ALIGN();/g' include/asm-generic/vmlinux.lds.h
 
-          # Hapus semua flag -Werror di Makefile & Kbuild agar Clang 19 tidak menghentikan build pada warning
+          # Hapus -Werror dari seluruh Makefile (termasuk mm/Makefile)
           find . -type f \( -name "Makefile*" -o -name "Kbuild*" \) -exec sed -i 's/-Werror//g' {} +
 
       - name: Build Kernel Image.gz
@@ -131,7 +151,7 @@ jobs:
           make O=out ARCH=arm64 x669c_defconfig
 
           make -j$(nproc --all) O=out ARCH=arm64 \
-               CC="clang --target=aarch64-linux-gnu -fno-integrated-as --prefix=/usr/bin/aarch64-linux-gnu-" \
+               CC="clang --target=aarch64-linux-gnu -fno-integrated-as -Wno-error -Wno-unused-but-set-variable --prefix=/usr/bin/aarch64-linux-gnu-" \
                LD=aarch64-linux-gnu-ld \
                AR=llvm-ar \
                NM=llvm-nm \
