@@ -145,7 +145,7 @@ jobs:
           make O=out ARCH=arm64 x669c_defconfig
 
           make -j$(nproc --all) O=out ARCH=arm64 \
-               CC="ccache clang --target=aarch64-linux-gnu -fno-integrated-as -Wno-error --prefix=/usr/bin/aarch64-linux-gnu-" \
+               CC="ccache clang -Wno-error -Wno-strict-prototypes -Wno-deprecated-non-prototype --target=aarch64-linux-gnu -fno-integrated-as -Wno-error --prefix=/usr/bin/aarch64-linux-gnu-" \
                LD=aarch64-linux-gnu-ld \
                AR=llvm-ar \
                NM=llvm-nm \
