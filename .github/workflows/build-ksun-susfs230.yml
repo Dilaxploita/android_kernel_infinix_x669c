@@ -58,7 +58,7 @@ jobs:
       - name: Setup KernelSU Next & SUSFS
         run: |
           if [ "${{ github.event.inputs.ksu }}" == "true" ]; then
-            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash
             ./scripts/config --file arch/arm64/configs/x669c_defconfig \
               -e CONFIG_KSU \
               -d CONFIG_KPROBES \
@@ -83,42 +83,31 @@ jobs:
 
             grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
 
-            python3 - << 'PYEOF'
-            with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-
-            new_lines = []
-            skip = False
-            injected_header = False
-
-            for line in lines:
-                if not injected_header and line.startswith("#include <linux/fs.h>"):
-                    new_lines.append(line)
-                    new_lines.append('#include "internal.h"\n')
-                    new_lines.append('#ifdef CONFIG_KSU\n')
-                    new_lines.append('extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n')
-                    new_lines.append('#endif\n')
-                    injected_header = True
-                    continue
-
-                if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
-                    skip = True
-                    new_lines.append("#ifdef CONFIG_KSU\n")
-                    new_lines.append("\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n")
-                    new_lines.append("#endif\n")
-                    new_lines.append("\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
-                    continue
-
-                if skip:
-                    if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
-                        skip = False
-                    continue
-
-                new_lines.append(line)
-
-            with open("fs/open.c", "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
-            PYEOF
+            python3 -c '
+          with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
+              lines = f.readlines()
+          new_lines = []
+          skip = False
+          injected = False
+          for line in lines:
+              if not injected and line.startswith("#include <linux/fs.h>"):
+                  new_lines.append(line)
+                  new_lines.append("#include \"internal.h\"\n#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n")
+                  injected = True
+                  continue
+              if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
+                  skip = True
+                  new_lines.append("#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
+                  continue
+              if skip:
+                  if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
+                      skip = False
+                  continue
+              new_lines.append(line)
+          with open("fs/open.c", "w", encoding="utf-8") as f:
+              f.writelines(new_lines)
+          print("fs/open.c fixed")
+          '
 
             ./scripts/config --file arch/arm64/configs/x669c_defconfig \
               -e CONFIG_KSU_SUSFS \
@@ -140,16 +129,7 @@ jobs:
 
       - name: Compatibility Fixes & Compile Kernel
         run: |
-          grep -q "stpcpy" lib/string.c || cat << 'STPEOF' >> lib/string.c
-
-          char *stpcpy(char *__restrict__ dest, const char *__restrict__ src)
-          {
-                  while ((*dest++ = *src++) != '\0')
-                          /* nothing */;
-                  return --dest;
-          }
-          EXPORT_SYMBOL(stpcpy);
-          STPEOF
+          grep -q "stpcpy" lib/string.c || printf '\nchar *stpcpy(char *__restrict__ dest, const char *__restrict__ src)\n{\n\twhile ((*dest++ = *src++) != '\''\\0'\'')\n\t\t;\n\treturn --dest;\n}\nEXPORT_SYMBOL(stpcpy);\n' >> lib/string.c
 
           grep -q "STRUCT_ALIGN();" include/asm-generic/vmlinux.lds.h || \
           sed -i 's/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) {/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) { STRUCT_ALIGN();/g' include/asm-generic/vmlinux.lds.h
@@ -185,34 +165,7 @@ jobs:
             cp out/arch/arm64/boot/mtk.dtb AnyKernel3/dtb
           fi
 
-          cat << 'AKEOF' > AnyKernel3/anykernel.sh
-          properties() { '
-          kernel.string=Rootzone Kernel KSUN+SUSFS - Infinix Hot 30i (X669C)
-          do.devicecheck=0
-          do.modules=0
-          do.systemless=1
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=X669C
-          device.name2=Infinix-X669C
-          device.name3=mt6765
-          supported.versions=
-          supported.patchlevels=
-          '; }
-
-          block=/dev/block/by-name/boot;
-          is_slot_device=0;
-          ramdisk_compression=auto;
-          patch_vbmeta_flag=auto;
-
-          . tools/ak3-core.sh;
-
-          set_perm_recursive 0 0 755 644 $ramdisk/*;
-          set_perm_recursive 0 0 750 750 $ramdisk/init* $ramdisk/sbin;
-
-          dump_boot;
-          write_boot;
-          AKEOF
+          printf "properties() { '\nkernel.string=Rootzone Kernel KSUN+SUSFS - Infinix Hot 30i (X669C)\ndo.devicecheck=0\ndo.modules=0\ndo.systemless=1\ndo.cleanup=1\ndo.cleanuponabort=0\ndevice.name1=X669C\ndevice.name2=Infinix-X669C\ndevice.name3=mt6765\nsupported.versions=\nsupported.patchlevels=\n'; }\n\nblock=/dev/block/by-name/boot;\nis_slot_device=0;\nramdisk_compression=auto;\npatch_vbmeta_flag=auto;\n\n. tools/ak3-core.sh;\n\nset_perm_recursive 0 0 755 644 \$ramdisk/*;\nset_perm_recursive 0 0 750 750 \$ramdisk/init* \$ramdisk/sbin;\n\ndump_boot;\nwrite_boot;\n" > AnyKernel3/anykernel.sh
 
           cd AnyKernel3
           DATE=$(date +"%Y%m%d-%H%M")
