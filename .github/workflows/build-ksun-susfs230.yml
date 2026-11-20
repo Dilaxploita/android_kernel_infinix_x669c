@@ -1,0 +1,208 @@
+name: Build Rootzone Kernel (KSUN + SUSFS 2.3.0 Backport)
+
+on:
+  workflow_dispatch:
+    inputs:
+      susfs_tag:
+        description: 'Branch / Tag SUSFS dari repo simonpunk'
+        required: true
+        default: 'gki-android12-5.10'
+        type: string
+      include_dtb:
+        description: 'Sertakan mtk.dtb ke dalam ZIP AnyKernel3'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build-kernel:
+    name: Compile X669C (4.19 + KSUN + SUSFS 2.3.0 Backport)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git \
+            libncurses5-dev libssl-dev libxml2 lzop python3 unzip zip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi wget
+
+      - name: Download AOSP Clang Toolchain
+        run: |
+          mkdir -p $HOME/clang
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r530567.tar.gz -O clang.tar.gz
+          tar -xzf clang.tar.gz -C $HOME/clang
+          rm -f clang.tar.gz
+
+      - name: Setup KernelSU Next (KSUN)
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+
+          ./scripts/config --file arch/arm64/configs/x669c_defconfig \
+            -e CONFIG_KSU \
+            -d CONFIG_KPROBES \
+            -d CONFIG_HAVE_KPROBES \
+            -d CONFIG_KRETPROBES
+
+      - name: Clone & Auto-Backport SUSFS 2.3.0 (5.10 -> 4.19 API)
+        run: |
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "${{ github.event.inputs.susfs_tag }}" ../susfs4ksu || \
+          git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git -b "${{ github.event.inputs.susfs_tag }}" ../susfs4ksu
+
+          # Salin file inti SUSFS & header ke source tree
+          cp -r ../susfs4ksu/kernel_patches/fs/* fs/
+          cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
+
+          # Backport otomatis API Kernel 5.10 -> 4.19 pada fs/susfs.c & header
+          python3 - << 'PYEOF'
+          import glob, re
+
+          targets = glob.glob("fs/susfs*.c") + glob.glob("include/linux/susfs*.h")
+          for path in targets:
+              with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                  code = f.read()
+
+              # 1. Ganti path_umount (5.9+) dengan ksys_umount (4.19)
+              code = re.sub(r'\bpath_umount\s*\(', 'ksys_umount(', code)
+
+              # 2. Ganti mmap_read_lock / mmap_read_unlock (5.8+) ke down_read / up_read mmap_sem (4.19)
+              code = re.sub(r'mmap_read_lock\s*\(\s*([^)]+)\s*\)', r'down_read(&(\1)->mmap_sem)', code)
+              code = re.sub(r'mmap_read_unlock\s*\(\s*([^)]+)\s*\)', r'up_read(&(\1)->mmap_sem)', code)
+              code = re.sub(r'mmap_write_lock\s*\(\s*([^)]+)\s*\)', r'down_write(&(\1)->mmap_sem)', code)
+              code = re.sub(r'mmap_write_unlock\s*\(\s*([^)]+)\s*\)', r'up_write(&(\1)->mmap_sem)', code)
+
+              # 3. Ganti TWA_RESUME (5.10) menjadi true pada task_work_add (4.19)
+              code = code.replace('TWA_RESUME', 'true')
+
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(code)
+          print("Backport API 5.10 -> 4.19 pada file inti SUSFS selesai.")
+          PYEOF
+
+          # Terapkan patch VFS & KernelSU Next (toleran terhadap perbedaan offset baris 4.19)
+          for p in ../susfs4ksu/kernel_patches/*.patch; do
+            patch -p1 --fuzz=3 --forward < "$p" || true
+          done
+
+          if [ -d "KernelSU-Next" ]; then
+            cd KernelSU-Next
+            for p in ../../susfs4ksu/kernel_patches/KernelSU/*.patch; do
+              [ -f "$p" ] && patch -p1 --fuzz=3 --forward < "$p" || true
+            done
+            cd ..
+          fi
+
+          # Daftarkan susfs.o ke fs/Makefile & fs/Kconfig jika belum masuk akibat fuzz patch
+          grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
+
+          # Aktifkan seluruh opsi SUSFS di x669c_defconfig
+          ./scripts/config --file arch/arm64/configs/x669c_defconfig \
+            -e CONFIG_KSU_SUSFS \
+            -e CONFIG_KSU_SUSFS_SUS_PATH \
+            -e CONFIG_KSU_SUSFS_SUS_MOUNT \
+            -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e CONFIG_KSU_SUSFS_SUS_KSTAT \
+            -e CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
+            -e CONFIG_KSU_SUSFS_TRY_UMOUNT \
+            -e CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            -e CONFIG_KSU_SUSFS_SPOOF_UNAME \
+            -e CONFIG_KSU_SUSFS_ENABLE_LOG \
+            -e CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            -e CONFIG_KSU_SUSFS_OPEN_REDIRECT \
+            -e CONFIG_KSU_SUSFS_SUS_SU
+
+      - name: Apply MT6765 Clang Compatibility Fixes
+        run: |
+          grep -q "stpcpy" lib/string.c || cat << 'STPEOF' >> lib/string.c
+
+          char *stpcpy(char *__restrict__ dest, const char *__restrict__ src)
+          {
+                  while ((*dest++ = *src++) != '\0')
+                          /* nothing */;
+                  return --dest;
+          }
+          EXPORT_SYMBOL(stpcpy);
+          STPEOF
+
+          grep -q "STRUCT_ALIGN();" include/asm-generic/vmlinux.lds.h || \
+          sed -i 's/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) {/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) { STRUCT_ALIGN();/g' include/asm-generic/vmlinux.lds.h
+
+      - name: Build Kernel Image.gz
+        run: |
+          export PATH="$HOME/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="Rootzone"
+          export KBUILD_BUILD_HOST="Infinix-X669C"
+
+          make O=out ARCH=arm64 x669c_defconfig
+
+          make -j$(nproc --all) O=out ARCH=arm64 \
+               CC="clang --target=aarch64-linux-gnu -fno-integrated-as --prefix=/usr/bin/aarch64-linux-gnu-" \
+               LD=aarch64-linux-gnu-ld \
+               AR=llvm-ar \
+               NM=llvm-nm \
+               OBJCOPY=llvm-objcopy \
+               OBJDUMP=llvm-objdump \
+               STRIP=llvm-strip \
+               CROSS_COMPILE=aarch64-linux-gnu- \
+               CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+               KCFLAGS="-Wno-misleading-indentation -Wno-unused-variable -Wno-sometimes-uninitialized -Wno-fortify-source" \
+               Image.gz
+
+      - name: Package AnyKernel3 Flashable ZIP
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cp out/arch/arm64/boot/Image.gz AnyKernel3/
+
+          if [ "${{ github.event.inputs.include_dtb }}" == "true" ] && [ -f "out/arch/arm64/boot/mtk.dtb" ]; then
+            cp out/arch/arm64/boot/mtk.dtb AnyKernel3/dtb
+          fi
+
+          cat << 'AKEOF' > AnyKernel3/anykernel.sh
+          # AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Rootzone Kernel KSUN + SUSFS 2.3.0 - Infinix Hot 30i (X669C)
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=X669C
+          device.name2=Infinix-X669C
+          device.name3=mt6765
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          block=/dev/block/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          set_perm_recursive 0 0 755 644 $ramdisk/*;
+          set_perm_recursive 0 0 750 750 $ramdisk/init* $ramdisk/sbin;
+
+          dump_boot;
+          write_boot;
+          AKEOF
+
+          cd AnyKernel3
+          DATE=$(date +"%Y%m%d-%H%M")
+          zip -r9 ../Kernel-X669C-KSUN-SUSFS230-${DATE}.zip * -x .git README.md *placeholder
+
+      - name: Upload Flashable ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-X669C-KSUN-SUSFS230
+          path: Kernel-X669C-KSUN-SUSFS230-*.zip
+          retention-days: 14
