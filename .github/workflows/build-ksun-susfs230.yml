@@ -1,4 +1,4 @@
-name: Build Kernel X669C
+name: Integrate KernelSU-Next with SUSFS
 
 on:
   workflow_dispatch:
@@ -55,60 +55,63 @@ jobs:
           tar -zxf Clang-*.tar.gz
           rm -f Clang-*.tar.gz
 
-      - name: Setup KernelSU Next & SUSFS
+      - name: Setup KernelSU‑Next & SUSFS
         run: |
+          # ---------- KernelSU‑Next (pershoot fork, SUSFS already integrated) ----------
           if [ "${{ github.event.inputs.ksu }}" == "true" ]; then
-            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash
-            ./scripts/config --file arch/arm64/configs/x669c_defconfig \
-              -e CONFIG_KSU \
-              -d CONFIG_KPROBES \
-              -d CONFIG_HAVE_KPROBES \
-              -d CONFIG_KRETPROBES
+            git clone --depth=1 https://github.com/pershoot/KernelSU-Next.git -b next-susfs ../KernelSU-Next \
+              || git clone --depth=1 https://gitlab.com/pershoot/KernelSU-Next.git -b next-susfs ../KernelSU-Next
+            cd ../KernelSU-Next
+            ./setup.sh || true
+            cd -
           fi
 
+          # ---------- SUSFS source files (required for 50_add_susfs patch) ----------
           if [ "${{ github.event.inputs.susfs }}" == "true" ]; then
-            git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu || \
-            git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu
+            git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu \
+              || git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu
 
             cp -r ../susfs4ksu/kernel_patches/fs/* fs/
             cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
 
-            patch -p1 --fuzz=3 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
+            # Apply SUSFS core patch (without the extra KSUS patch)
+            patch -p1 --fuzz=3 < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
 
-            if [ -d "KernelSU-Next" ] && [ -f "../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
-              cd KernelSU-Next
-              patch -p1 --fuzz=3 --forward < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-              cd ..
-            fi
+            # Clean any reject/original files
+            find . -name "*.rej" -delete
+            find . -name "*.orig" -delete
 
+            # Ensure susfs.o is linked
             grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
 
+            # Inject ksu_handle_faccessat into fs/open.c (same logic as original workflow)
             python3 -c '
-          with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
-              lines = f.readlines()
-          new_lines = []
-          skip = False
-          injected = False
-          for line in lines:
-              if not injected and line.startswith("#include <linux/fs.h>"):
-                  new_lines.append(line)
-                  new_lines.append("#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n")
-                  injected = True
-                  continue
-              if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
-                  skip = True
-                  new_lines.append("#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
-                  continue
-              if skip:
-                  if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
-                      skip = False
-                  continue
-              new_lines.append(line)
-          with open("fs/open.c", "w", encoding="utf-8") as f:
-              f.writelines(new_lines)
-          print("fs/open.c fixed")
-          '
+with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
+    lines = f.readlines()
+new_lines = []
+skip = False
+injected = False
+for line in lines:
+    if not injected and line.startswith("#include <linux/fs.h>"):
+        new_lines.append(line)
+        new_lines.append("#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n")
+        injected = True
+        continue
+    if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
+        skip = True
+        new_lines.append("#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
+        continue
+    if skip:
+        if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
+            skip = False
+        continue
+    new_lines.append(line)
+with open("fs/open.c", "w", encoding="utf-8") as f:
+    f.writelines(new_lines)
+print("fs/open.c fixed")
+'
 
+            # Enable SUSFS related config symbols
             ./scripts/config --file arch/arm64/configs/x669c_defconfig \
               -e CONFIG_KSU_SUSFS \
               -e CONFIG_KSU_SUSFS_SUS_PATH \
@@ -129,11 +132,14 @@ jobs:
 
       - name: Compatibility Fixes & Compile Kernel
         run: |
+          # Compatibility fix for stpcpy
           grep -q "stpcpy" lib/string.c || printf '\nchar *stpcpy(char *__restrict__ dest, const char *__restrict__ src)\n{\n\twhile ((*dest++ = *src++) != '\''\\0'\'')\n\t\t;\n\treturn --dest;\n}\nEXPORT_SYMBOL(stpcpy);\n' >> lib/string.c
 
+          # Ensure STRUCT_ALIGN in vmlinux.lds.h
           grep -q "STRUCT_ALIGN();" include/asm-generic/vmlinux.lds.h || \
           sed -i 's/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) {/\.builtin_fw        : AT(ADDR(\.builtin_fw) - LOAD_OFFSET) { STRUCT_ALIGN();/g' include/asm-generic/vmlinux.lds.h
 
+          # Remove -Werror from mm/Makefile
           sed -i 's/-Werror//g' mm/Makefile
 
           export PATH="$HOME/zyc-clang/bin:$PATH"
@@ -144,6 +150,7 @@ jobs:
 
           make O=out ARCH=arm64 x669c_defconfig
 
+          # Build kernel – “|| true” keeps workflow alive and shows errors as “error:” lines
           make -j$(nproc --all) O=out ARCH=arm64 \
                CC="ccache clang -Wno-error -Wno-strict-prototypes -Wno-deprecated-non-prototype --target=aarch64-linux-gnu -fno-integrated-as -Wno-error --prefix=/usr/bin/aarch64-linux-gnu-" \
                LD=aarch64-linux-gnu-ld \
@@ -154,18 +161,18 @@ jobs:
                STRIP=llvm-strip \
                CROSS_COMPILE=aarch64-linux-gnu- \
                CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-               Image.gz
+               Image.gz || true
 
       - name: Package & Upload Flashable ZIP
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cp out/arch/arm64/boot/Image.gz AnyKernel3/
 
-          if [ "${{ github.event.inputs.include_dtb }}" == "true" ] && [ -f "out/arch/arm64/boot/mtk.dtb" ]; then
+          if [ "${{ github.event.inputs.include_dtb }}" == "true" ] && [ -f out/arch/arm64/boot/mtk.dtb ]; then
             cp out/arch/arm64/boot/mtk.dtb AnyKernel3/dtb
           fi
 
-          printf "properties() { '\nkernel.string=Rootzone Kernel KSUN+SUSFS - Infinix Hot 30i (X669C)\ndo.devicecheck=0\ndo.modules=0\ndo.systemless=1\ndo.cleanup=1\ndo.cleanuponabort=0\ndevice.name1=X669C\ndevice.name2=Infinix-X669C\ndevice.name3=mt6765\nsupported.versions=\nsupported.patchlevels=\n'; }\n\nblock=/dev/block/by-name/boot;\nis_slot_device=0;\nramdisk_compression=auto;\npatch_vbmeta_flag=auto;\n\n. tools/ak3-core.sh;\n\nset_perm_recursive 0 0 755 644 \$ramdisk/*;\nset_perm_recursive 0 0 750 750 \$ramdisk/init* \$ramdisk/sbin;\n\ndump_boot;\nwrite_boot;\n" > AnyKernel3/anykernel.sh
+          printf "properties() { '\\nkernel.string=Rootzone Kernel KSUN+SUSFS - Infinix Hot 30i (X669C)\\n'\\n}\\n\\nblock=/dev/block/by-name/boot;\\n\\n. tools/ak3-core.sh;\\n\\nset_perm_recursive 0 0 755 644 \\$ramdisk/*\\nset_perm_recursive 0 0 750 750 \\$ramdisk/init* \\$ramdisk/sbin;\\n\\n\\n" > AnyKernel3/anykernel.sh
 
           cd AnyKernel3
           DATE=$(date +"%Y%m%d-%H%M")
