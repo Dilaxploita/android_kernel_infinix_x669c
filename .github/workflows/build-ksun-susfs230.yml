@@ -55,64 +55,68 @@ jobs:
           tar -zxf Clang-*.tar.gz
           rm -f Clang-*.tar.gz
 
-      - name: Setup KernelSU‑Next & SUSFS
+      - name: Setup KernelSU-Next & SUSFS
         run: |
-          # ---------- KernelSU‑Next (pershoot fork, SUSFS already integrated) ----------
+          # ---------- KernelSU-Next (pershoot fork, SUSFS already integrated) ----------
           if [ "${{ github.event.inputs.ksu }}" == "true" ]; then
-            git clone --depth=1 https://github.com/pershoot/KernelSU-Next.git -b next-susfs ../KernelSU-Next \
-              || git clone --depth=1 https://gitlab.com/pershoot/KernelSU-Next.git -b next-susfs ../KernelSU-Next
-            cd ../KernelSU-Next
-            ./setup.sh || true
-            cd -
+            git clone --depth=1 https://github.com/pershoot/KernelSU-Next.git -b next-susfs ../KernelSU-Next
+            # Jalankan setup.sh dari root kernel agar symlink drivers/kernelsu mengarah dengan benar
+            bash ../KernelSU-Next/setup.sh next-susfs || bash ../KernelSU-Next/setup.sh
           fi
 
-          # ---------- SUSFS source files (required for 50_add_susfs patch) ----------
+          # ---------- SUSFS source files (Kernel 4.19) ----------
           if [ "${{ github.event.inputs.susfs }}" == "true" ]; then
-            git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu \
-              || git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu
+            git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git -b kernel-4.19 ../susfs4ksu
 
             cp -r ../susfs4ksu/kernel_patches/fs/* fs/
             cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
 
-            # Apply SUSFS core patch (without the extra KSUS patch)
+            # Apply SUSFS core patch
             patch -p1 --fuzz=3 < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
 
-            # Clean any reject/original files
-            find . -name "*.rej" -delete
+            # Tampilkan peringatan & isi .rej jika ada hunk yang gagal agar mudah dilacak
+            if find . -name "*.rej" | grep -q .; then
+              echo "=== WARNING: Ditemukan file .rej yang gagal di-patch ==="
+              find . -name "*.rej" -exec head -n 50 {} +
+              find . -name "*.rej" -delete
+            fi
             find . -name "*.orig" -delete
 
-            # Ensure susfs.o is linked
-            grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
+            # Pastikan susfs.o ter-compile
+            grep -q "susfs.o" fs/Makefile || echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
 
-            # Inject ksu_handle_faccessat into fs/open.c (same logic as original workflow)
-            python3 -c '
-with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
-    lines = f.readlines()
-new_lines = []
-skip = False
-injected = False
-for line in lines:
-    if not injected and line.startswith("#include <linux/fs.h>"):
-        new_lines.append(line)
-        new_lines.append("#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n")
-        injected = True
-        continue
-    if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
-        skip = True
-        new_lines.append("#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
-        continue
-    if skip:
-        if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
-            skip = False
-        continue
-    new_lines.append(line)
-with open("fs/open.c", "w", encoding="utf-8") as f:
-    f.writelines(new_lines)
-print("fs/open.c fixed")
-'
+            # Inject ksu_handle_faccessat ke fs/open.c jika belum ada
+            if ! grep -q "ksu_handle_faccessat" fs/open.c; then
+              python3 -c '
+          with open("fs/open.c", "r", encoding="utf-8", errors="ignore") as f:
+              lines = f.readlines()
+          new_lines = []
+          skip = False
+          injected = False
+          for line in lines:
+              if not injected and line.startswith("#include <linux/fs.h>"):
+                  new_lines.append(line)
+                  new_lines.append("#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n")
+                  injected = True
+                  continue
+              if "fname = getname_flags(filename, lookup_flags, NULL);" in line:
+                  skip = True
+                  new_lines.append("#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n\tres = user_path_at(dfd, filename, lookup_flags, &path);\n")
+                  continue
+              if skip:
+                  if "res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);" in line:
+                      skip = False
+                  continue
+              new_lines.append(line)
+          with open("fs/open.c", "w", encoding="utf-8") as f:
+              f.writelines(new_lines)
+          print("fs/open.c fixed")
+          '
+            fi
 
-            # Enable SUSFS related config symbols
+            # Aktifkan opsi SUSFS di x669c_defconfig
             ./scripts/config --file arch/arm64/configs/x669c_defconfig \
+              -e CONFIG_KSU \
               -e CONFIG_KSU_SUSFS \
               -e CONFIG_KSU_SUSFS_SUS_PATH \
               -e CONFIG_KSU_SUSFS_SUS_MOUNT \
@@ -150,9 +154,10 @@ print("fs/open.c fixed")
 
           make O=out ARCH=arm64 x669c_defconfig
 
-          # Build kernel – “|| true” keeps workflow alive and shows errors as “error:” lines
-          make -j$(nproc --all) O=out ARCH=arm64 \
-               CC="ccache clang -Wno-error -Wno-strict-prototypes -Wno-deprecated-non-prototype --target=aarch64-linux-gnu -fno-integrated-as -Wno-error --prefix=/usr/bin/aarch64-linux-gnu-" \
+          # Simpan log penuh ke build.log dan tampilkan baris error jika gagal
+          set -o pipefail
+          if ! make -j$(nproc --all) O=out ARCH=arm64 \
+               CC="ccache clang -Wno-error -Wno-strict-prototypes -Wno-deprecated-non-prototype --target=aarch64-linux-gnu -fno-integrated-as --prefix=/usr/bin/aarch64-linux-gnu-" \
                LD=aarch64-linux-gnu-ld \
                AR=llvm-ar \
                NM=llvm-nm \
@@ -161,7 +166,11 @@ print("fs/open.c fixed")
                STRIP=llvm-strip \
                CROSS_COMPILE=aarch64-linux-gnu- \
                CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-               Image.gz || true
+               Image.gz 2>&1 | tee build.log; then
+            echo "================ COMPILER ERRORS ================"
+            grep -n -C 3 "error:" build.log || tail -n 100 build.log
+            exit 1
+          fi
 
       - name: Package & Upload Flashable ZIP
         run: |
@@ -172,7 +181,25 @@ print("fs/open.c fixed")
             cp out/arch/arm64/boot/mtk.dtb AnyKernel3/dtb
           fi
 
-          printf "properties() { '\\nkernel.string=Rootzone Kernel KSUN+SUSFS - Infinix Hot 30i (X669C)\\n'\\n}\\n\\nblock=/dev/block/by-name/boot;\\n\\n. tools/ak3-core.sh;\\n\\nset_perm_recursive 0 0 755 644 \\$ramdisk/*\\nset_perm_recursive 0 0 750 750 \\$ramdisk/init* \\$ramdisk/sbin;\\n\\n\\n" > AnyKernel3/anykernel.sh
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          properties() { '
+          kernel.string=Rootzone Kernel KSUN+SUSFS - Infinix Hot 30i (X669C)
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          '; }
+
+          block=/dev/block/by-name/boot;
+          is_slot_device=auto;
+          ramdisk_compression=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          EOF
 
           cd AnyKernel3
           DATE=$(date +"%Y%m%d-%H%M")
